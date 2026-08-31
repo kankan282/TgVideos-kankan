@@ -1,286 +1,436 @@
+import os
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Header, Depends, Query
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from typing import List, Optional
-from config import Config
-from database import Database
-from forwarder import ChannelForwarder, scheduler
-from tg_client import TelegramClientManager
-from otp_handler import OTPManager
+from pydantic import BaseModel
+from tg_client import TGAuthManager
+from speed_engine import SpeedEngine
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-db = Database()
-forwarder = ChannelForwarder()
 
-# ─── Models ───
-class TaskCreate(BaseModel):
-    source_channel: str = Field(..., description="@channel ya t.me link ya ID")
-    target_channel: str = Field(..., description="Kaha forward karna hai")
-    interval_minutes: int = Field(60, ge=1, description="Kitne min baad repeat")
-    content_types: List[str] = Field(["all"], description="video,photo,document,audio,text,all")
-    batch_size: int = Field(50, ge=1, le=200, description="Ek baar me kitne msgs")
-    name: str = Field("", description="Task ka naam")
+engine = SpeedEngine()
 
-class OTPSubmit(BaseModel):
-    code: str = Field(..., description="5-digit OTP code")
+# ─── Pydantic Models ───
+class SendOTPReq(BaseModel):
+    api_id: int
+    api_hash: str
+    phone: str
 
-class TaskUpdate(BaseModel):
-    interval_minutes: Optional[int] = None
-    content_types: Optional[List[str]] = None
-    batch_size: Optional[int] = None
-    name: Optional[str] = None
+class VerifyOTPReq(BaseModel):
+    otp: str
 
-# ─── Auth ───
-def auth(x_api_key: str = Header(None, alias="x-api-key")):
-    if x_api_key != Config.API_KEY:
-        raise HTTPException(401, "🔒 Invalid API Key")
-    return True
+class Verify2FAReq(BaseModel):
+    password: str
 
-# ─── Lifespan ───
+class ForwardReq(BaseModel):
+    source: str
+    target: str
+    limit: int = 20
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Starting TG Forwarder Pro...")
-    task = asyncio.create_task(scheduler())
+    # Auto connect if session exists
+    try:
+        if await TGAuthManager.is_logged_in():
+            logger.info("✅ Auto Logged in with saved session!")
+    except Exception as e:
+        logger.warning(f"Startup session check: {e}")
     yield
-    task.cancel()
-    await TelegramClientManager.stop()
 
-# ─── App ───
-app = FastAPI(
-    title="⚡ TG Forwarder Pro API",
-    description="Ultra-fast channel forwarding with parallel processing",
-    version="3.0",
-    lifespan=lifespan
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ═══════════════════════════════════════════════════
-#  📡 API ENDPOINTS
-# ═══════════════════════════════════════════════════
-
-@app.get("/")
-async def root():
-    return {
-        "🟢 status": "running",
-        "⚡ engine": "parallel-speed-v3",
-        "📖 docs": "/docs",
-        "🔐 otp_waiting": OTPManager.is_waiting()
-    }
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# ─────────────────────────────────────
-#  🔐 OTP ENDPOINTS
-# ─────────────────────────────────────
+# ═══════════════════════════════════════════════════
+# 🔐 AUTHENTICATION ENDPOINTS
+# ═══════════════════════════════════════════════════
 
-@app.post("/api/otp/submit")
-async def submit_otp(otp: OTPSubmit):
-    """
-    🔐 Jab server OTP maange toh yaha code bhejo.
-    Render Logs me dikhega 'Enter OTP' → yaha submit karo.
-    """
-    if OTPManager.submit_otp(otp.code):
-        return {"success": True, "message": "✅ OTP submitted! Logging in..."}
-    return {"success": False, "message": "⚠️ OTP not requested right now"}
+@app.get("/api/auth/status")
+async def auth_status():
+    logged = await TGAuthManager.is_logged_in()
+    if logged:
+        user = await TGAuthManager.get_me()
+        return {
+            "logged_in": True,
+            "user": {
+                "name": f"{user.first_name or ''} {user.last_name or ''}".strip(),
+                "username": f"@{user.username}" if user.username else "No username",
+                "phone": user.phone_number,
+                "id": user.id
+            }
+        }
+    return {"logged_in": False}
 
-@app.get("/api/otp/status")
-async def otp_status():
-    """Check karo ki OTP ka wait ho raha hai ya nahi"""
-    return {
-        "waiting": OTPManager.is_waiting(),
-        "message": "OTP chahiye!" if OTPManager.is_waiting() else "All good ✅"
-    }
+@app.post("/api/auth/send-otp")
+async def send_otp(req: SendOTPReq):
+    try:
+        res = await TGAuthManager.send_otp(req.api_id, req.api_hash, req.phone)
+        return {"success": True, "data": res}
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
-# ─────────────────────────────────────
-#  📋 TASK MANAGEMENT
-# ─────────────────────────────────────
+@app.post("/api/auth/verify-otp")
+async def verify_otp(req: VerifyOTPReq):
+    try:
+        res = await TGAuthManager.verify_otp(req.otp)
+        return {"success": True, "data": res}
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
-@app.post("/api/task/create")
-async def create_task(task: TaskCreate, _: bool = Depends(auth)):
-    """
-    ⚡ Naya forwarding task banao.
-    Pehli baar turant forward karega!
-    """
-    tid = db.add_task(
-        source=task.source_channel,
-        target=task.target_channel,
-        interval=task.interval_minutes,
-        content_types=task.content_types,
-        batch_size=task.batch_size,
-        name=task.name
-    )
+@app.post("/api/auth/verify-2fa")
+async def verify_2fa(req: Verify2FAReq):
+    try:
+        res = await TGAuthManager.verify_2fa(req.password)
+        return {"success": True, "data": res}
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
-    # Turant pehla forward
-    tasks = db.get_active_tasks()
-    result = {}
-    for t in tasks:
-        if t["id"] == tid:
-            result = await forwarder.run_task(t)
-            break
+@app.post("/api/auth/logout")
+async def logout():
+    res = await TGAuthManager.logout()
+    return {"success": True, "data": res}
 
-    return {
-        "success": True,
-        "task_id": tid,
-        "first_run": result
-    }
+# ═══════════════════════════════════════════════════
+# ⚡ FORWARDING ENDPOINT
+# ═══════════════════════════════════════════════════
 
-@app.get("/api/tasks")
-async def list_tasks(_: bool = Depends(auth)):
-    """Saare tasks dekho"""
-    tasks = db.get_all_tasks()
-    return {"total": len(tasks), "tasks": tasks}
+@app.post("/api/forward/start")
+async def start_forward(req: ForwardReq):
+    if not await TGAuthManager.is_logged_in():
+        raise HTTPException(401, "Pehle account login karo!")
 
-@app.get("/api/task/{tid}")
-async def get_task(tid: int, _: bool = Depends(auth)):
-    """Single task ki detail"""
-    tasks = db.get_all_tasks()
-    for t in tasks:
-        if t["id"] == tid:
-            return t
-    raise HTTPException(404, "Task not found")
+    client = TGAuthManager.client
+    source = req.source.strip()
+    target = req.target.strip()
 
-@app.put("/api/task/{tid}")
-async def update_task(tid: int, update: TaskUpdate, _: bool = Depends(auth)):
-    """Task update karo"""
-    # Simple implementation - delete and recreate
-    return {"success": True, "message": "Updated (recreate for full changes)"}
+    if source.isdigit() or source.startswith("-"):
+        source = int(source)
+    if target.isdigit() or target.startswith("-"):
+        target = int(target)
 
-@app.put("/api/task/{tid}/toggle")
-async def toggle_task(tid: int, active: bool = Query(...), _: bool = Depends(auth)):
-    """Task ON/OFF karo"""
-    db.toggle_task(tid, active)
-    return {"success": True, "status": "active" if active else "paused"}
+    messages = []
+    async for msg in client.get_chat_history(source, limit=req.limit):
+        messages.append(msg)
 
-@app.delete("/api/task/{tid}")
-async def delete_task(tid: int, _: bool = Depends(auth)):
-    """Task delete karo"""
-    db.delete_task(tid)
-    return {"success": True, "message": f"🗑️ Task {tid} deleted"}
+    if not messages:
+        return {"success": False, "message": "Source channel me koi messages nahi mile"}
 
-# ─────────────────────────────────────
-#  ⚡ MANUAL ACTIONS
-# ─────────────────────────────────────
-
-@app.post("/api/task/{tid}/forward-now")
-async def forward_now(
-    tid: int,
-    limit: int = Query(50, ge=1, le=200),
-    _: bool = Depends(auth)
-):
-    """⚡ Turant forward karo (schedule ka wait mat karo)"""
-    tasks = db.get_all_tasks()
-    for t in tasks:
-        if t["id"] == tid:
-            t["batch_size"] = limit
-            result = await forwarder.run_task(t)
-            return {"success": True, "result": result}
-    raise HTTPException(404, "Task not found")
-
-@app.post("/api/quick-forward")
-async def quick_forward(
-    source: str = Query(...),
-    target: str = Query(...),
-    limit: int = Query(20, ge=1, le=100),
-    _: bool = Depends(auth)
-):
-    """
-    ⚡ Bina task banaye turant forward karo (one-time)
-    Example: /api/quick-forward?source=@abc&target=@xyz&limit=20
-    """
-    temp_task = {
-        "id": 0,
-        "source_channel": source,
-        "target_channel": target,
-        "content_types": ["all"],
-        "last_forwarded_id": 0,
-        "batch_size": limit
-    }
-    result = await forwarder.run_task(temp_task)
+    # Run Parallel Forward
+    result = await engine.bulk_forward(client, messages, target, ["all"])
     return {"success": True, "result": result}
 
-# ─────────────────────────────────────
-#  🔍 CHANNEL INFO
-# ─────────────────────────────────────
 
-@app.get("/api/channel/info")
-async def channel_info(channel: str = Query(...), _: bool = Depends(auth)):
-    """Channel ki info check karo"""
-    try:
-        client = await TelegramClientManager.get_client()
-        parsed = await forwarder.parse_channel(channel)
-        chat = await client.get_chat(parsed)
-        return {
-            "id": chat.id,
-            "title": chat.title,
-            "type": str(chat.type),
-            "members": getattr(chat, 'members_count', 'N/A'),
-            "restricted": getattr(chat, 'has_protected_content', False),
-            "description": getattr(chat, 'description', '')[:200]
+# ═══════════════════════════════════════════════════
+# 📱 VISUAL WEB DASHBOARD (HTML / JS / CSS)
+# ═══════════════════════════════════════════════════
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚡ TG Forwarder Ultra Pro</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { background: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
+        .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1); }
+    </style>
+</head>
+<body class="p-4 max-w-md mx-auto pb-20">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between my-4">
+        <div>
+            <h1 class="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-500">
+                ⚡ TG Forwarder
+            </h1>
+            <p class="text-xs text-slate-400">Restricted Channel Auto-Cloner</p>
+        </div>
+        <div id="statusBadge" class="px-3 py-1 text-xs rounded-full bg-red-500/20 text-red-400 border border-red-500/30 flex items-center gap-1.5">
+            <span class="w-2 h-2 rounded-full bg-red-400 animate-pulse"></span> Disconnected
+        </div>
+    </div>
+
+    <!-- 1. ACCOUNT PANEL -->
+    <div class="glass rounded-2xl p-5 mb-4 shadow-xl">
+        <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3 flex items-center gap-2">
+            <i class="fa-solid fa-user-shield text-cyan-400"></i> Telegram Account
+        </h2>
+
+        <!-- State: Logged In -->
+        <div id="loggedInView" class="hidden">
+            <div class="bg-slate-800/60 rounded-xl p-3 border border-slate-700 mb-3 flex items-center justify-between">
+                <div>
+                    <p id="accName" class="font-bold text-white text-base"></p>
+                    <p id="accUsername" class="text-xs text-cyan-400"></p>
+                    <p id="accPhone" class="text-xs text-slate-400"></p>
+                </div>
+                <div class="bg-emerald-500/20 text-emerald-400 text-xs px-2.5 py-1 rounded-lg border border-emerald-500/30 font-medium">
+                    Active
+                </div>
+            </div>
+            <button onclick="logout()" class="w-full bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 font-semibold py-2.5 rounded-xl transition text-sm flex items-center justify-center gap-2">
+                <i class="fa-solid fa-right-from-bracket"></i> Remove / Logout Account
+            </button>
+        </div>
+
+        <!-- State: Step 1 (Credentials & Phone) -->
+        <div id="step1View">
+            <div class="space-y-3">
+                <div>
+                    <label class="text-xs text-slate-400 mb-1 block">API ID</label>
+                    <input id="apiId" type="number" placeholder="e.g. 12345678" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-400 mb-1 block">API HASH</label>
+                    <input id="apiHash" type="text" placeholder="e.g. f864ef50fdd7..." class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-400 mb-1 block">Phone Number (With Country Code)</label>
+                    <input id="phone" type="text" placeholder="+58XXXXXXXXXX" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
+                </div>
+                <button onclick="sendOTP()" id="sendOtpBtn" class="w-full bg-gradient-to-r from-cyan-500 to-blue-600 font-bold py-3 rounded-xl shadow-lg shadow-cyan-500/20 hover:opacity-90 transition text-sm flex items-center justify-center gap-2">
+                    <span>Send Login OTP</span> <i class="fa-solid fa-paper-plane"></i>
+                </button>
+            </div>
+        </div>
+
+        <!-- State: Step 2 (OTP Input) -->
+        <div id="step2View" class="hidden">
+            <div class="p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-300 text-xs mb-3">
+                <i class="fa-solid fa-bell"></i> OTP tumhare <b>Telegram App</b> ke chat me aaya hoga!
+            </div>
+            <label class="text-xs text-slate-400 mb-1 block">Enter 5-Digit OTP Code</label>
+            <input id="otpCode" type="text" placeholder="12345" class="w-full bg-slate-900/80 border border-cyan-500/50 rounded-xl px-3 py-3 text-center text-xl font-mono tracking-widest text-cyan-300 mb-3 focus:outline-none">
+            
+            <button onclick="verifyOTP()" id="verifyOtpBtn" class="w-full bg-emerald-500 hover:bg-emerald-600 font-bold py-3 rounded-xl shadow-lg shadow-emerald-500/20 transition text-sm mb-2">
+                Verify & Login
+            </button>
+            <button onclick="resetAuthView()" class="w-full text-xs text-slate-400 hover:text-white py-1">Back</button>
+        </div>
+
+        <!-- State: Step 3 (2FA Password) -->
+        <div id="step3View" class="hidden">
+            <label class="text-xs text-slate-400 mb-1 block">Two-Step Verification Password</label>
+            <input id="password2fa" type="password" placeholder="Enter 2FA Password" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm mb-3 focus:outline-none focus:border-cyan-400">
+            <button onclick="verify2FA()" class="w-full bg-indigo-500 hover:bg-indigo-600 font-bold py-3 rounded-xl transition text-sm">
+                Submit Password
+            </button>
+        </div>
+    </div>
+
+    <!-- 2. FAST FORWARD PANEL -->
+    <div id="forwardPanel" class="glass rounded-2xl p-5 mb-4 shadow-xl opacity-50 pointer-events-none transition-all">
+        <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3 flex items-center gap-2">
+            <i class="fa-solid fa-bolt text-yellow-400"></i> Fast Forward Task
+        </h2>
+        <div class="space-y-3">
+            <div>
+                <label class="text-xs text-slate-400 mb-1 block">Source Channel (Private/Restricted)</label>
+                <input id="sourceChan" type="text" placeholder="@source_channel or -100xxxxxxx" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
+            </div>
+            <div>
+                <label class="text-xs text-slate-400 mb-1 block">Target Channel (Where you are admin)</label>
+                <input id="targetChan" type="text" placeholder="@target_channel or -100xxxxxxx" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
+            </div>
+            <div>
+                <label class="text-xs text-slate-400 mb-1 block">Messages Count (Recent limit)</label>
+                <input id="msgLimit" type="number" value="20" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
+            </div>
+
+            <button onclick="startForward()" id="fwdBtn" class="w-full bg-gradient-to-r from-amber-500 to-orange-600 font-bold py-3.5 rounded-xl shadow-lg shadow-orange-500/20 hover:opacity-90 transition text-sm flex items-center justify-center gap-2">
+                <i class="fa-solid fa-play"></i> ⚡ Start Ultra-Fast Clone
+            </button>
+        </div>
+    </div>
+
+    <!-- 3. LIVE LOGS -->
+    <div class="glass rounded-2xl p-4 shadow-xl">
+        <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-2">
+            <i class="fa-solid fa-terminal text-emerald-400"></i> Execution Output
+        </h2>
+        <div id="logs" class="bg-black/50 border border-slate-800 rounded-xl p-3 text-xs font-mono h-32 overflow-y-auto space-y-1 text-slate-300">
+            <p class="text-slate-500">> Ready for commands...</p>
+        </div>
+    </div>
+
+    <script>
+        function log(msg, color="text-slate-300") {
+            const el = document.getElementById("logs");
+            el.innerHTML += `<p class="${color}">> ${msg}</p>`;
+            el.scrollTop = el.scrollHeight;
         }
-    except Exception as e:
-        raise HTTPException(400, f"❌ {str(e)}")
 
-@app.get("/api/channel/messages")
-async def preview_messages(
-    channel: str = Query(...),
-    limit: int = Query(10, ge=1, le=50),
-    _: bool = Depends(auth)
-):
-    """Channel ke latest messages preview karo"""
-    try:
-        client = await TelegramClientManager.get_client()
-        parsed = await forwarder.parse_channel(channel)
-        messages = []
-        async for msg in client.get_chat_history(parsed, limit=limit):
-            messages.append({
-                "id": msg.id,
-                "date": str(msg.date),
-                "type": forwarder.engine._get_type(msg),
-                "text": (msg.text or msg.caption or "")[:100],
-                "has_media": bool(msg.media)
-            })
-        return {"channel": channel, "count": len(messages), "messages": messages}
-    except Exception as e:
-        raise HTTPException(400, f"❌ {str(e)}")
+        async function checkStatus() {
+            try {
+                const r = await fetch('/api/auth/status');
+                const d = await r.json();
+                if(d.logged_in) {
+                    document.getElementById("statusBadge").className = "px-3 py-1 text-xs rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1.5";
+                    document.getElementById("statusBadge").innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400"></span> Connected';
+                    
+                    document.getElementById("accName").innerText = d.user.name || "User";
+                    document.getElementById("accUsername").innerText = d.user.username;
+                    document.getElementById("accPhone").innerText = "+" + d.user.phone;
 
-# ─────────────────────────────────────
-#  📊 STATS & LOGS
-# ─────────────────────────────────────
+                    document.getElementById("step1View").classList.add("hidden");
+                    document.getElementById("step2View").classList.add("hidden");
+                    document.getElementById("step3View").classList.add("hidden");
+                    document.getElementById("loggedInView").classList.remove("hidden");
+                    
+                    // Enable Forwarding Panel
+                    document.getElementById("forwardPanel").classList.remove("opacity-50", "pointer-events-none");
+                } else {
+                    resetAuthView();
+                }
+            } catch(e) {
+                log("Status check failed", "text-red-400");
+            }
+        }
 
-@app.get("/api/stats")
-async def stats(_: bool = Depends(auth)):
-    """Overall stats"""
-    tasks = db.get_all_tasks()
-    active = [t for t in tasks if t["is_active"]]
-    return {
-        "total_tasks": len(tasks),
-        "active_tasks": len(active),
-        "paused_tasks": len(tasks) - len(active),
-        "otp_waiting": OTPManager.is_waiting()
-    }
+        function resetAuthView() {
+            document.getElementById("statusBadge").className = "px-3 py-1 text-xs rounded-full bg-red-500/20 text-red-400 border border-red-500/30 flex items-center gap-1.5";
+            document.getElementById("statusBadge").innerHTML = '<span class="w-2 h-2 rounded-full bg-red-400 animate-pulse"></span> Disconnected';
+            document.getElementById("loggedInView").classList.add("hidden");
+            document.getElementById("step2View").classList.add("hidden");
+            document.getElementById("step3View").classList.add("hidden");
+            document.getElementById("step1View").classList.remove("hidden");
+            document.getElementById("forwardPanel").classList.add("opacity-50", "pointer-events-none");
+        }
 
-@app.get("/api/logs")
-async def get_logs(
-    task_id: Optional[int] = None,
-    limit: int = Query(50, ge=1, le=200),
-    _: bool = Depends(auth)
-):
-    """Forwarding logs dekho"""
-    logs = db.get_logs(task_id, limit)
-    return {"count": len(logs), "logs": logs}
+        async function sendOTP() {
+            const api_id = parseInt(document.getElementById("apiId").value);
+            const api_hash = document.getElementById("apiHash").value;
+            const phone = document.getElementById("phone").value;
+
+            if(!api_id || !api_hash || !phone) return alert("Saare fields bharo!");
+
+            log("Sending OTP request to Telegram...", "text-yellow-400");
+            document.getElementById("sendOtpBtn").disabled = true;
+
+            try {
+                const res = await fetch('/api/auth/send-otp', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({api_id, api_hash, phone})
+                });
+                const data = await res.json();
+                if(data.success) {
+                    log("✅ OTP successfully sent! Check your Telegram App.", "text-emerald-400");
+                    document.getElementById("step1View").classList.add("hidden");
+                    document.getElementById("step2View").classList.remove("hidden");
+                } else {
+                    log("❌ Error: " + data.detail, "text-red-400");
+                }
+            } catch(e) {
+                log("Error: " + e, "text-red-400");
+            } finally {
+                document.getElementById("sendOtpBtn").disabled = false;
+            }
+        }
+
+        async function verifyOTP() {
+            const otp = document.getElementById("otpCode").value;
+            if(!otp) return alert("OTP daalo!");
+
+            log("Verifying OTP...", "text-yellow-400");
+            try {
+                const res = await fetch('/api/auth/verify-otp', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({otp})
+                });
+                const data = await res.json();
+                if(data.success) {
+                    if(data.data.status === "2fa_required") {
+                        log("⚠️ 2FA Enabled! Password required.", "text-amber-400");
+                        document.getElementById("step2View").classList.add("hidden");
+                        document.getElementById("step3View").classList.remove("hidden");
+                    } else {
+                        log("🎉 Login Successful!", "text-emerald-400");
+                        checkStatus();
+                    }
+                } else {
+                    log("❌ " + data.detail, "text-red-400");
+                }
+            } catch(e) {
+                log("Error: " + e, "text-red-400");
+            }
+        }
+
+        async function verify2FA() {
+            const password = document.getElementById("password2fa").value;
+            if(!password) return alert("Password daalo!");
+
+            try {
+                const res = await fetch('/api/auth/verify-2fa', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({password})
+                });
+                const data = await res.json();
+                if(data.success) {
+                    log("🎉 2FA Verified & Login Successful!", "text-emerald-400");
+                    checkStatus();
+                } else {
+                    log("❌ " + data.detail, "text-red-400");
+                }
+            } catch(e) {
+                log("Error: " + e, "text-red-400");
+            }
+        }
+
+        async function logout() {
+            if(!confirm("Account remove karna chahte ho?")) return;
+            log("Logging out...", "text-yellow-400");
+            await fetch('/api/auth/logout', {method: 'POST'});
+            log("Account successfully removed!", "text-cyan-400");
+            checkStatus();
+        }
+
+        async function startForward() {
+            const source = document.getElementById("sourceChan").value;
+            const target = document.getElementById("targetChan").value;
+            const limit = parseInt(document.getElementById("msgLimit").value);
+
+            if(!source || !target) return alert("Source aur Target dono daalo!");
+
+            log(`⚡ Cloning started: ${source} ➔ ${target}`, "text-cyan-400");
+            document.getElementById("fwdBtn").disabled = true;
+
+            try {
+                const res = await fetch('/api/forward/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({source, target, limit})
+                });
+                const d = await res.json();
+                if(d.success) {
+                    log(`✅ Done in ${d.result.time}s! Success: ${d.result.success}, Failed: ${d.result.failed}`, "text-emerald-400");
+                } else {
+                    log("❌ " + (d.message || d.detail), "text-red-400");
+                }
+            } catch(e) {
+                log("Forwarding error: " + e, "text-red-400");
+            } finally {
+                document.getElementById("fwdBtn").disabled = false;
+            }
+        }
+
+        // On Load
+        checkStatus();
+    </script>
+</body>
+</html>
+    """
