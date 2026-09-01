@@ -1,44 +1,44 @@
-import os
 import asyncio
+import json
+import time
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from tg_client import TGAuthManager
-from speed_engine import SpeedEngine
+from typing import List, Optional
 
-logging.basicConfig(level=logging.INFO)
+from tg_client import TGClient
+from forwarder import ForwardEngine
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-engine = SpeedEngine()
+engine = ForwardEngine()
+log_queue = asyncio.Queue()
 
-# ─── Pydantic Models ───
-class SendOTPReq(BaseModel):
+# ── Models ──
+class OTPSend(BaseModel):
     api_id: int
     api_hash: str
     phone: str
 
-class VerifyOTPReq(BaseModel):
+class OTPVerify(BaseModel):
     otp: str
 
-class Verify2FAReq(BaseModel):
+class TwoFA(BaseModel):
     password: str
 
-class ForwardReq(BaseModel):
+class FwdReq(BaseModel):
     source: str
     target: str
-    limit: int = 20
+    limit: int = 50
+    types: List[str] = ["all"]
 
+# ── App ──
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Auto connect if session exists
-    try:
-        if await TGAuthManager.is_logged_in():
-            logger.info("✅ Auto Logged in with saved session!")
-    except Exception as e:
-        logger.warning(f"Startup session check: {e}")
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -48,389 +48,372 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 async def health():
     return {"status": "ok"}
 
-# ═══════════════════════════════════════════════════
-# 🔐 AUTHENTICATION ENDPOINTS
-# ═══════════════════════════════════════════════════
+# ══════════════════════════════════════
+#  🔐 AUTH
+# ══════════════════════════════════════
 
 @app.get("/api/auth/status")
 async def auth_status():
-    logged = await TGAuthManager.is_logged_in()
-    if logged:
-        user = await TGAuthManager.get_me()
+    if await TGClient.is_logged_in():
+        me = await TGClient.get_me()
         return {
             "logged_in": True,
             "user": {
-                "name": f"{user.first_name or ''} {user.last_name or ''}".strip(),
-                "username": f"@{user.username}" if user.username else "No username",
-                "phone": user.phone_number,
-                "id": user.id
+                "name": f"{me.first_name or ''} {me.last_name or ''}".strip(),
+                "username": f"@{me.username}" if me.username else "—",
+                "phone": me.phone_number or "—",
+                "id": me.id
             }
         }
     return {"logged_in": False}
 
 @app.post("/api/auth/send-otp")
-async def send_otp(req: SendOTPReq):
+async def send_otp(r: OTPSend):
     try:
-        res = await TGAuthManager.send_otp(req.api_id, req.api_hash, req.phone)
-        return {"success": True, "data": res}
+        return await TGClient.send_otp(r.api_id, r.api_hash, r.phone)
     except Exception as e:
         raise HTTPException(400, str(e))
 
 @app.post("/api/auth/verify-otp")
-async def verify_otp(req: VerifyOTPReq):
+async def verify_otp(r: OTPVerify):
     try:
-        res = await TGAuthManager.verify_otp(req.otp)
-        return {"success": True, "data": res}
+        return await TGClient.verify_otp(r.otp)
     except Exception as e:
         raise HTTPException(400, str(e))
 
 @app.post("/api/auth/verify-2fa")
-async def verify_2fa(req: Verify2FAReq):
+async def verify_2fa(r: TwoFA):
     try:
-        res = await TGAuthManager.verify_2fa(req.password)
-        return {"success": True, "data": res}
+        return await TGClient.verify_2fa(r.password)
     except Exception as e:
         raise HTTPException(400, str(e))
 
 @app.post("/api/auth/logout")
 async def logout():
-    res = await TGAuthManager.logout()
-    return {"success": True, "data": res}
+    return await TGClient.logout()
 
-# ═══════════════════════════════════════════════════
-# ⚡ FORWARDING ENDPOINT
-# ═══════════════════════════════════════════════════
+# ══════════════════════════════════════
+#  ⚡ FORWARDING
+# ══════════════════════════════════════
 
 @app.post("/api/forward/start")
-async def start_forward(req: ForwardReq):
-    if not await TGAuthManager.is_logged_in():
-        raise HTTPException(401, "Pehle account login karo!")
+async def start_forward(r: FwdReq):
+    if not await TGClient.is_logged_in():
+        raise HTTPException(401, "Pehle login karo!")
 
-    client = TGAuthManager.client
-    source = req.source.strip()
-    target = req.target.strip()
+    # Clear old logs
+    while not log_queue.empty():
+        log_queue.get_nowait()
 
-    if source.isdigit() or source.startswith("-"):
-        source = int(source)
-    if target.isdigit() or target.startswith("-"):
-        target = int(target)
+    async def progress_cb(msg, level):
+        await log_queue.put({"msg": msg, "level": level, "ts": time.time()})
 
-    messages = []
-    async for msg in client.get_chat_history(source, limit=req.limit):
-        messages.append(msg)
+    # Run in background
+    asyncio.create_task(
+        engine.run(r.source, r.target, r.limit, r.types, progress_cb)
+    )
+    return {"ok": True, "message": "Forwarding started! Check logs."}
 
-    if not messages:
-        return {"success": False, "message": "Source channel me koi messages nahi mile"}
+@app.post("/api/forward/stop")
+async def stop_forward():
+    engine.cancel()
+    return {"ok": True, "message": "Stopping..."}
 
-    # Run Parallel Forward
-    result = await engine.bulk_forward(client, messages, target, ["all"])
-    return {"success": True, "result": result}
+# ══════════════════════════════════════
+#  📡 REAL-TIME LOGS (SSE)
+# ══════════════════════════════════════
 
+@app.get("/api/logs/stream")
+async def log_stream():
+    """Server-Sent Events — Real-time logs browser me dikhata hai"""
+    async def event_generator():
+        while True:
+            try:
+                data = await asyncio.wait_for(log_queue.get(), timeout=30)
+                yield f"data: {json.dumps(data)}\n\n"
+            except asyncio.TimeoutError:
+                yield f"data: {json.dumps({'msg': '💓 heartbeat', 'level': 'ping'})}\n\n"
 
-# ═══════════════════════════════════════════════════
-# 📱 VISUAL WEB DASHBOARD (HTML / JS / CSS)
-# ═══════════════════════════════════════════════════
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+# ══════════════════════════════════════
+#  📱 WEB DASHBOARD
+# ══════════════════════════════════════
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    return """
-<!DOCTYPE html>
+    return """<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>⚡ TG Forwarder Ultra Pro</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <style>
-        body { background: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
-        .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1); }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>⚡ TG Forwarder Pro</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+*{box-sizing:border-box}
+body{background:#0a0e1a;color:#e2e8f0;font-family:system-ui,sans-serif;margin:0;padding:12px}
+.glass{background:rgba(15,23,42,.85);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:16px;margin-bottom:12px}
+input{width:100%;background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:10px 12px;color:#fff;font-size:14px;outline:none}
+input:focus{border-color:#06b6d4}
+.btn{width:100%;padding:12px;border-radius:12px;font-weight:700;font-size:14px;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;transition:.2s}
+.btn:active{transform:scale(.97)}
+.btn-cyan{background:linear-gradient(135deg,#06b6d4,#3b82f6);color:#fff}
+.btn-green{background:linear-gradient(135deg,#10b981,#059669);color:#fff}
+.btn-red{background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)}
+.btn-orange{background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff}
+.btn-gray{background:#1e293b;color:#94a3b8}
+#logBox{background:#000;border:1px solid #1e293b;border-radius:10px;padding:10px;height:280px;overflow-y:auto;font-family:'Courier New',monospace;font-size:11px;line-height:1.6}
+.log-success{color:#34d399}.log-error{color:#f87171}.log-warn{color:#fbbf24}
+.log-skip{color:#64748b}.log-info{color:#94a3b8}.log-ping{color:#334155}
+.badge{padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;display:inline-flex;align-items:center;gap:5px}
+.badge-on{background:rgba(16,185,129,.15);color:#34d399;border:1px solid rgba(16,185,129,.3)}
+.badge-off{background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.dot-on{background:#34d399}.dot-off{background:#f87171;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.hidden{display:none!important}
+label{font-size:11px;color:#64748b;margin-bottom:4px;display:block}
+</style>
 </head>
-<body class="p-4 max-w-md mx-auto pb-20">
+<body>
 
-    <!-- Header -->
-    <div class="flex items-center justify-between my-4">
-        <div>
-            <h1 class="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-500">
-                ⚡ TG Forwarder
-            </h1>
-            <p class="text-xs text-slate-400">Restricted Channel Auto-Cloner</p>
-        </div>
-        <div id="statusBadge" class="px-3 py-1 text-xs rounded-full bg-red-500/20 text-red-400 border border-red-500/30 flex items-center gap-1.5">
-            <span class="w-2 h-2 rounded-full bg-red-400 animate-pulse"></span> Disconnected
-        </div>
+<div style="max-width:420px;margin:0 auto">
+
+<!-- HEADER -->
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+  <div>
+    <h1 style="font-size:20px;font-weight:900;background:linear-gradient(90deg,#06b6d4,#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin:0">⚡ TG Forwarder Pro</h1>
+    <p style="font-size:10px;color:#475569;margin:2px 0 0">Restricted Channel Cloner</p>
+  </div>
+  <div id="badge" class="badge badge-off"><span class="dot dot-off"></span> Offline</div>
+</div>
+
+<!-- AUTH PANEL -->
+<div class="glass" id="authPanel">
+  <h3 style="font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin:0 0 12px">🔐 Account Setup</h3>
+
+  <!-- Logged In View -->
+  <div id="viewLoggedIn" class="hidden">
+    <div style="background:#0f172a;border-radius:10px;padding:12px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center">
+      <div>
+        <div id="uName" style="font-weight:700;font-size:15px"></div>
+        <div id="uUser" style="font-size:12px;color:#06b6d4"></div>
+        <div id="uPhone" style="font-size:11px;color:#475569"></div>
+      </div>
+      <span class="badge badge-on"><span class="dot dot-on"></span> Active</span>
     </div>
+    <button class="btn btn-red" onclick="doLogout()">🚪 Remove / Logout Account</button>
+  </div>
 
-    <!-- 1. ACCOUNT PANEL -->
-    <div class="glass rounded-2xl p-5 mb-4 shadow-xl">
-        <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3 flex items-center gap-2">
-            <i class="fa-solid fa-user-shield text-cyan-400"></i> Telegram Account
-        </h2>
-
-        <!-- State: Logged In -->
-        <div id="loggedInView" class="hidden">
-            <div class="bg-slate-800/60 rounded-xl p-3 border border-slate-700 mb-3 flex items-center justify-between">
-                <div>
-                    <p id="accName" class="font-bold text-white text-base"></p>
-                    <p id="accUsername" class="text-xs text-cyan-400"></p>
-                    <p id="accPhone" class="text-xs text-slate-400"></p>
-                </div>
-                <div class="bg-emerald-500/20 text-emerald-400 text-xs px-2.5 py-1 rounded-lg border border-emerald-500/30 font-medium">
-                    Active
-                </div>
-            </div>
-            <button onclick="logout()" class="w-full bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 font-semibold py-2.5 rounded-xl transition text-sm flex items-center justify-center gap-2">
-                <i class="fa-solid fa-right-from-bracket"></i> Remove / Logout Account
-            </button>
-        </div>
-
-        <!-- State: Step 1 (Credentials & Phone) -->
-        <div id="step1View">
-            <div class="space-y-3">
-                <div>
-                    <label class="text-xs text-slate-400 mb-1 block">API ID</label>
-                    <input id="apiId" type="number" placeholder="e.g. 12345678" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
-                </div>
-                <div>
-                    <label class="text-xs text-slate-400 mb-1 block">API HASH</label>
-                    <input id="apiHash" type="text" placeholder="e.g. f864ef50fdd7..." class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
-                </div>
-                <div>
-                    <label class="text-xs text-slate-400 mb-1 block">Phone Number (With Country Code)</label>
-                    <input id="phone" type="text" placeholder="+58XXXXXXXXXX" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
-                </div>
-                <button onclick="sendOTP()" id="sendOtpBtn" class="w-full bg-gradient-to-r from-cyan-500 to-blue-600 font-bold py-3 rounded-xl shadow-lg shadow-cyan-500/20 hover:opacity-90 transition text-sm flex items-center justify-center gap-2">
-                    <span>Send Login OTP</span> <i class="fa-solid fa-paper-plane"></i>
-                </button>
-            </div>
-        </div>
-
-        <!-- State: Step 2 (OTP Input) -->
-        <div id="step2View" class="hidden">
-            <div class="p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-300 text-xs mb-3">
-                <i class="fa-solid fa-bell"></i> OTP tumhare <b>Telegram App</b> ke chat me aaya hoga!
-            </div>
-            <label class="text-xs text-slate-400 mb-1 block">Enter 5-Digit OTP Code</label>
-            <input id="otpCode" type="text" placeholder="12345" class="w-full bg-slate-900/80 border border-cyan-500/50 rounded-xl px-3 py-3 text-center text-xl font-mono tracking-widest text-cyan-300 mb-3 focus:outline-none">
-            
-            <button onclick="verifyOTP()" id="verifyOtpBtn" class="w-full bg-emerald-500 hover:bg-emerald-600 font-bold py-3 rounded-xl shadow-lg shadow-emerald-500/20 transition text-sm mb-2">
-                Verify & Login
-            </button>
-            <button onclick="resetAuthView()" class="w-full text-xs text-slate-400 hover:text-white py-1">Back</button>
-        </div>
-
-        <!-- State: Step 3 (2FA Password) -->
-        <div id="step3View" class="hidden">
-            <label class="text-xs text-slate-400 mb-1 block">Two-Step Verification Password</label>
-            <input id="password2fa" type="password" placeholder="Enter 2FA Password" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm mb-3 focus:outline-none focus:border-cyan-400">
-            <button onclick="verify2FA()" class="w-full bg-indigo-500 hover:bg-indigo-600 font-bold py-3 rounded-xl transition text-sm">
-                Submit Password
-            </button>
-        </div>
+  <!-- Step 1: Credentials -->
+  <div id="viewStep1">
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <div><label>API ID</label><input id="inApiId" type="number" placeholder="12345678"></div>
+      <div><label>API HASH</label><input id="inApiHash" placeholder="f864ef50fdd7..."></div>
+      <div><label>Phone (with country code)</label><input id="inPhone" placeholder="+58XXXXXXXXXX"></div>
+      <button class="btn btn-cyan" onclick="doSendOTP()" id="btnSend">📨 Send OTP to Telegram</button>
     </div>
+  </div>
 
-    <!-- 2. FAST FORWARD PANEL -->
-    <div id="forwardPanel" class="glass rounded-2xl p-5 mb-4 shadow-xl opacity-50 pointer-events-none transition-all">
-        <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3 flex items-center gap-2">
-            <i class="fa-solid fa-bolt text-yellow-400"></i> Fast Forward Task
-        </h2>
-        <div class="space-y-3">
-            <div>
-                <label class="text-xs text-slate-400 mb-1 block">Source Channel (Private/Restricted)</label>
-                <input id="sourceChan" type="text" placeholder="@source_channel or -100xxxxxxx" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
-            </div>
-            <div>
-                <label class="text-xs text-slate-400 mb-1 block">Target Channel (Where you are admin)</label>
-                <input id="targetChan" type="text" placeholder="@target_channel or -100xxxxxxx" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
-            </div>
-            <div>
-                <label class="text-xs text-slate-400 mb-1 block">Messages Count (Recent limit)</label>
-                <input id="msgLimit" type="number" value="20" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-cyan-400 text-white">
-            </div>
-
-            <button onclick="startForward()" id="fwdBtn" class="w-full bg-gradient-to-r from-amber-500 to-orange-600 font-bold py-3.5 rounded-xl shadow-lg shadow-orange-500/20 hover:opacity-90 transition text-sm flex items-center justify-center gap-2">
-                <i class="fa-solid fa-play"></i> ⚡ Start Ultra-Fast Clone
-            </button>
-        </div>
+  <!-- Step 2: OTP -->
+  <div id="viewStep2" class="hidden">
+    <div style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.2);border-radius:10px;padding:10px;margin-bottom:10px;font-size:12px;color:#fbbf24">
+      ⚠️ OTP tumhare <b>Telegram App</b> ke andar aaya hoga (SMS nahi!)
     </div>
+    <label>5-Digit OTP Code</label>
+    <input id="inOtp" placeholder="12345" style="text-align:center;font-size:22px;letter-spacing:8px;font-weight:700;color:#06b6d4">
+    <button class="btn btn-green" onclick="doVerifyOTP()" style="margin-top:8px">✅ Verify & Login</button>
+    <button class="btn btn-gray" onclick="showStep(1)" style="margin-top:6px">← Back</button>
+  </div>
 
-    <!-- 3. LIVE LOGS -->
-    <div class="glass rounded-2xl p-4 shadow-xl">
-        <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-2">
-            <i class="fa-solid fa-terminal text-emerald-400"></i> Execution Output
-        </h2>
-        <div id="logs" class="bg-black/50 border border-slate-800 rounded-xl p-3 text-xs font-mono h-32 overflow-y-auto space-y-1 text-slate-300">
-            <p class="text-slate-500">> Ready for commands...</p>
-        </div>
+  <!-- Step 3: 2FA -->
+  <div id="viewStep3" class="hidden">
+    <label>2FA Password</label>
+    <input id="in2fa" type="password" placeholder="Your 2FA password">
+    <button class="btn btn-green" onclick="doVerify2FA()" style="margin-top:8px">🔓 Submit Password</button>
+  </div>
+</div>
+
+<!-- FORWARD PANEL -->
+<div class="glass" id="fwdPanel" style="opacity:.4;pointer-events:none">
+  <h3 style="font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin:0 0 12px">⚡ Fast Forward</h3>
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <div>
+      <label>Source Channel / Message Link</label>
+      <input id="inSrc" placeholder="@channel or t.me/channel/14">
     </div>
+    <div>
+      <label>Target Channel (You must be admin)</label>
+      <input id="inTgt" placeholder="@my_channel or -100xxxx">
+    </div>
+    <div>
+      <label>Message Limit (kitne msg forward karne hain)</label>
+      <input id="inLimit" type="number" value="30" min="1" max="500">
+    </div>
+    <div style="display:flex;gap:6px">
+      <button class="btn btn-orange" onclick="doForward()" id="btnFwd" style="flex:1">▶ Start Clone</button>
+      <button class="btn btn-red" onclick="doStop()" style="flex:.4">⏹</button>
+    </div>
+  </div>
+</div>
 
-    <script>
-        function log(msg, color="text-slate-300") {
-            const el = document.getElementById("logs");
-            el.innerHTML += `<p class="${color}">> ${msg}</p>`;
-            el.scrollTop = el.scrollHeight;
-        }
+<!-- LIVE LOGS -->
+<div class="glass">
+  <h3 style="font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin:0 0 8px">📡 Live Logs</h3>
+  <div id="logBox"><span class="log-info">> Waiting...</span></div>
+</div>
 
-        async function checkStatus() {
-            try {
-                const r = await fetch('/api/auth/status');
-                const d = await r.json();
-                if(d.logged_in) {
-                    document.getElementById("statusBadge").className = "px-3 py-1 text-xs rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1.5";
-                    document.getElementById("statusBadge").innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400"></span> Connected';
-                    
-                    document.getElementById("accName").innerText = d.user.name || "User";
-                    document.getElementById("accUsername").innerText = d.user.username;
-                    document.getElementById("accPhone").innerText = "+" + d.user.phone;
+</div>
 
-                    document.getElementById("step1View").classList.add("hidden");
-                    document.getElementById("step2View").classList.add("hidden");
-                    document.getElementById("step3View").classList.add("hidden");
-                    document.getElementById("loggedInView").classList.remove("hidden");
-                    
-                    // Enable Forwarding Panel
-                    document.getElementById("forwardPanel").classList.remove("opacity-50", "pointer-events-none");
-                } else {
-                    resetAuthView();
-                }
-            } catch(e) {
-                log("Status check failed", "text-red-400");
-            }
-        }
+<script>
+const $ = id => document.getElementById(id);
 
-        function resetAuthView() {
-            document.getElementById("statusBadge").className = "px-3 py-1 text-xs rounded-full bg-red-500/20 text-red-400 border border-red-500/30 flex items-center gap-1.5";
-            document.getElementById("statusBadge").innerHTML = '<span class="w-2 h-2 rounded-full bg-red-400 animate-pulse"></span> Disconnected';
-            document.getElementById("loggedInView").classList.add("hidden");
-            document.getElementById("step2View").classList.add("hidden");
-            document.getElementById("step3View").classList.add("hidden");
-            document.getElementById("step1View").classList.remove("hidden");
-            document.getElementById("forwardPanel").classList.add("opacity-50", "pointer-events-none");
-        }
+function showStep(n) {
+  $('viewStep1').classList.toggle('hidden', n!==1);
+  $('viewStep2').classList.toggle('hidden', n!==2);
+  $('viewStep3').classList.toggle('hidden', n!==3);
+  $('viewLoggedIn').classList.toggle('hidden', n!==0);
+}
 
-        async function sendOTP() {
-            const api_id = parseInt(document.getElementById("apiId").value);
-            const api_hash = document.getElementById("apiHash").value;
-            const phone = document.getElementById("phone").value;
+function addLog(msg, level='info') {
+  const box = $('logBox');
+  const t = new Date().toLocaleTimeString();
+  box.innerHTML += `<div class="log-${level}">[${t}] ${msg}</div>`;
+  box.scrollTop = box.scrollHeight;
+}
 
-            if(!api_id || !api_hash || !phone) return alert("Saare fields bharo!");
+// ── SSE Real-time Logs ──
+function connectLogs() {
+  const es = new EventSource('/api/logs/stream');
+  es.onmessage = e => {
+    try {
+      const d = JSON.parse(e.data);
+      if (d.level !== 'ping') addLog(d.msg, d.level);
+    } catch {}
+  };
+  es.onerror = () => setTimeout(connectLogs, 3000);
+}
+connectLogs();
 
-            log("Sending OTP request to Telegram...", "text-yellow-400");
-            document.getElementById("sendOtpBtn").disabled = true;
+// ── Auth Status ──
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/auth/status');
+    const d = await r.json();
+    if (d.logged_in) {
+      $('uName').textContent = d.user.name;
+      $('uUser').textContent = d.user.username;
+      $('uPhone').textContent = '+' + d.user.phone;
+      showStep(0);
+      $('badge').className = 'badge badge-on';
+      $('badge').innerHTML = '<span class="dot dot-on"></span> Online';
+      $('fwdPanel').style.opacity = '1';
+      $('fwdPanel').style.pointerEvents = 'auto';
+    } else {
+      showStep(1);
+      $('badge').className = 'badge badge-off';
+      $('badge').innerHTML = '<span class="dot dot-off"></span> Offline';
+      $('fwdPanel').style.opacity = '.4';
+      $('fwdPanel').style.pointerEvents = 'none';
+    }
+  } catch {}
+}
 
-            try {
-                const res = await fetch('/api/auth/send-otp', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({api_id, api_hash, phone})
-                });
-                const data = await res.json();
-                if(data.success) {
-                    log("✅ OTP successfully sent! Check your Telegram App.", "text-emerald-400");
-                    document.getElementById("step1View").classList.add("hidden");
-                    document.getElementById("step2View").classList.remove("hidden");
-                } else {
-                    log("❌ Error: " + data.detail, "text-red-400");
-                }
-            } catch(e) {
-                log("Error: " + e, "text-red-400");
-            } finally {
-                document.getElementById("sendOtpBtn").disabled = false;
-            }
-        }
+async function doSendOTP() {
+  const api_id = parseInt($('inApiId').value);
+  const api_hash = $('inApiHash').value;
+  const phone = $('inPhone').value;
+  if (!api_id || !api_hash || !phone) return alert('Sab fields bharo!');
+  $('btnSend').textContent = '⏳ Sending...';
+  try {
+    const r = await fetch('/api/auth/send-otp', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({api_id, api_hash, phone})
+    });
+    const d = await r.json();
+    if (d.ok || r.ok) {
+      addLog('✅ OTP sent! Check Telegram App.', 'success');
+      showStep(2);
+    } else {
+      addLog('❌ ' + (d.detail||'Error'), 'error');
+    }
+  } catch(e) { addLog('❌ '+e, 'error'); }
+  $('btnSend').textContent = '📨 Send OTP to Telegram';
+}
 
-        async function verifyOTP() {
-            const otp = document.getElementById("otpCode").value;
-            if(!otp) return alert("OTP daalo!");
+async function doVerifyOTP() {
+  const otp = $('inOtp').value;
+  if (!otp) return;
+  try {
+    const r = await fetch('/api/auth/verify-otp', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({otp})
+    });
+    const d = await r.json();
+    if (d.status === '2fa') {
+      addLog('⚠️ 2FA Password chahiye!', 'warn');
+      showStep(3);
+    } else if (d.status === 'success' || r.ok) {
+      addLog('🎉 Login Successful!', 'success');
+      checkAuth();
+    } else {
+      addLog('❌ '+(d.detail||'Error'), 'error');
+    }
+  } catch(e) { addLog('❌ '+e, 'error'); }
+}
 
-            log("Verifying OTP...", "text-yellow-400");
-            try {
-                const res = await fetch('/api/auth/verify-otp', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({otp})
-                });
-                const data = await res.json();
-                if(data.success) {
-                    if(data.data.status === "2fa_required") {
-                        log("⚠️ 2FA Enabled! Password required.", "text-amber-400");
-                        document.getElementById("step2View").classList.add("hidden");
-                        document.getElementById("step3View").classList.remove("hidden");
-                    } else {
-                        log("🎉 Login Successful!", "text-emerald-400");
-                        checkStatus();
-                    }
-                } else {
-                    log("❌ " + data.detail, "text-red-400");
-                }
-            } catch(e) {
-                log("Error: " + e, "text-red-400");
-            }
-        }
+async function doVerify2FA() {
+  const pw = $('in2fa').value;
+  if (!pw) return;
+  try {
+    const r = await fetch('/api/auth/verify-2fa', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({password: pw})
+    });
+    const d = await r.json();
+    if (r.ok) { addLog('🎉 2FA Done!', 'success'); checkAuth(); }
+    else addLog('❌ '+(d.detail||'Error'), 'error');
+  } catch(e) { addLog('❌ '+e, 'error'); }
+}
 
-        async function verify2FA() {
-            const password = document.getElementById("password2fa").value;
-            if(!password) return alert("Password daalo!");
+async function doLogout() {
+  if (!confirm('Account hata do?')) return;
+  await fetch('/api/auth/logout', {method:'POST'});
+  addLog('🚪 Logged out!', 'warn');
+  checkAuth();
+}
 
-            try {
-                const res = await fetch('/api/auth/verify-2fa', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({password})
-                });
-                const data = await res.json();
-                if(data.success) {
-                    log("🎉 2FA Verified & Login Successful!", "text-emerald-400");
-                    checkStatus();
-                } else {
-                    log("❌ " + data.detail, "text-red-400");
-                }
-            } catch(e) {
-                log("Error: " + e, "text-red-400");
-            }
-        }
+async function doForward() {
+  const source = $('inSrc').value;
+  const target = $('inTgt').value;
+  const limit = parseInt($('inLimit').value) || 30;
+  if (!source || !target) return alert('Source aur Target dono daalo!');
+  $('btnFwd').textContent = '⏳ Running...';
+  $('btnFwd').disabled = true;
+  $('logBox').innerHTML = '';
+  addLog('🚀 Forwarding started...', 'info');
+  try {
+    await fetch('/api/forward/start', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({source, target, limit, types:['all']})
+    });
+  } catch(e) { addLog('❌ '+e, 'error'); }
+  setTimeout(() => {
+    $('btnFwd').textContent = '▶ Start Clone';
+    $('btnFwd').disabled = false;
+  }, 5000);
+}
 
-        async function logout() {
-            if(!confirm("Account remove karna chahte ho?")) return;
-            log("Logging out...", "text-yellow-400");
-            await fetch('/api/auth/logout', {method: 'POST'});
-            log("Account successfully removed!", "text-cyan-400");
-            checkStatus();
-        }
+async function doStop() {
+  await fetch('/api/forward/stop', {method:'POST'});
+  addLog('⏹ Stopped!', 'warn');
+}
 
-        async function startForward() {
-            const source = document.getElementById("sourceChan").value;
-            const target = document.getElementById("targetChan").value;
-            const limit = parseInt(document.getElementById("msgLimit").value);
-
-            if(!source || !target) return alert("Source aur Target dono daalo!");
-
-            log(`⚡ Cloning started: ${source} ➔ ${target}`, "text-cyan-400");
-            document.getElementById("fwdBtn").disabled = true;
-
-            try {
-                const res = await fetch('/api/forward/start', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({source, target, limit})
-                });
-                const d = await res.json();
-                if(d.success) {
-                    log(`✅ Done in ${d.result.time}s! Success: ${d.result.success}, Failed: ${d.result.failed}`, "text-emerald-400");
-                } else {
-                    log("❌ " + (d.message || d.detail), "text-red-400");
-                }
-            } catch(e) {
-                log("Forwarding error: " + e, "text-red-400");
-            } finally {
-                document.getElementById("fwdBtn").disabled = false;
-            }
-        }
-
-        // On Load
-        checkStatus();
-    </script>
+checkAuth();
+</script>
 </body>
-</html>
-    """
+</html>"""
