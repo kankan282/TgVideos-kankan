@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import asyncio
 from pyrogram import Client
@@ -10,89 +11,128 @@ from pyrogram.errors import (
 
 logger = logging.getLogger(__name__)
 SESSION_FILE = "user_session"
+AUTH_STATE_FILE = "auth_state.json"
 
 class TGClient:
     client: Client = None
-    phone_code_hash: str = None
-    temp_phone: str = None
     _lock = asyncio.Lock()
+
+    @classmethod
+    def _save_auth_state(cls, data: dict):
+        with open(AUTH_STATE_FILE, "w") as f:
+            json.dump(data, f)
+
+    @classmethod
+    def _load_auth_state(cls) -> dict:
+        if os.path.exists(AUTH_STATE_FILE):
+            try:
+                with open(AUTH_STATE_FILE, "r") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    @classmethod
+    def _clear_auth_state(cls):
+        if os.path.exists(AUTH_STATE_FILE):
+            os.remove(AUTH_STATE_FILE)
 
     # ── Auth Flow ──
 
     @classmethod
     async def send_otp(cls, api_id: int, api_hash: str, phone: str):
-        # Purana session hatao
         await cls._cleanup()
 
         cls.client = Client(
-            name=SESSION_FILE, api_id=api_id,
-            api_hash=api_hash, workdir="."
+            name=SESSION_FILE,
+            api_id=api_id,
+            api_hash=api_hash,
+            workdir="."
         )
         await cls.client.connect()
 
         try:
-            sent = await cls.client.send_code(phone)
-            cls.phone_code_hash = sent.phone_code_hash
-            cls.temp_phone = phone
-            return {"ok": True}
+            sent = await cls.client.send_code(phone.strip())
+            # Save hash to file so it never gets lost
+            cls._save_auth_state({
+                "api_id": api_id,
+                "api_hash": api_hash,
+                "phone": phone.strip(),
+                "phone_code_hash": sent.phone_code_hash
+            })
+            return {"ok": True, "message": "OTP sent successfully"}
         except FloodWait as e:
-            raise Exception(f"FloodWait! {e.value} sec baad try karo")
+            raise Exception(f"FloodWait! {e.value} seconds wait karo")
         except Exception as e:
-            raise Exception(f"OTP bhejne me error: {e}")
+            raise Exception(f"OTP send error: {str(e)}")
 
     @classmethod
     async def verify_otp(cls, code: str):
-        if not cls.client or not cls.phone_code_hash:
-            raise Exception("Pehle OTP send karo!")
+        state = cls._load_auth_state()
+        if not state.get("phone_code_hash"):
+            raise Exception("Session state lost! Kripya dobara 'Send OTP' karein.")
+
+        if cls.client is None or not cls.client.is_connected:
+            cls.client = Client(
+                name=SESSION_FILE,
+                api_id=state["api_id"],
+                api_hash=state["api_hash"],
+                workdir="."
+            )
+            await cls.client.connect()
+
         try:
             user = await cls.client.sign_in(
-                cls.temp_phone, cls.phone_code_hash, code.strip()
+                state["phone"],
+                state["phone_code_hash"],
+                code.strip()
             )
+            cls._clear_auth_state()
             return {"ok": True, "status": "success", "name": user.first_name}
         except SessionPasswordNeeded:
             return {"ok": True, "status": "2fa"}
         except (PhoneCodeInvalid, PhoneCodeExpired):
-            raise Exception("OTP galat ya expired hai!")
+            raise Exception("Galat ya Expired OTP!")
+        except Exception as e:
+            raise Exception(f"Verification error: {str(e)}")
 
     @classmethod
     async def verify_2fa(cls, password: str):
         if not cls.client:
-            raise Exception("Session nahi hai!")
+            state = cls._load_auth_state()
+            if not state.get("api_id"):
+                raise Exception("Session nahi mila!")
+            cls.client = Client(
+                name=SESSION_FILE,
+                api_id=state["api_id"],
+                api_hash=state["api_hash"],
+                workdir="."
+            )
+            await cls.client.connect()
+
         try:
-            user = await cls.client.check_password(password)
+            user = await cls.client.check_password(password.strip())
+            cls._clear_auth_state()
             return {"ok": True, "name": user.first_name}
         except PasswordHashInvalid:
-            raise Exception("2FA password galat hai!")
+            raise Exception("2FA Password galat hai!")
 
-    # ── Session Management ──
+    # ── Client Auto Reconnect ──
 
     @classmethod
     async def ensure_connected(cls) -> Client:
-        """Auto-reconnect agar disconnect ho gaya ho"""
         async with cls._lock:
             if cls.client is None:
                 if not os.path.exists(f"{SESSION_FILE}.session"):
-                    raise Exception("Koi session nahi hai! Pehle login karo.")
-                # Session file se load karo — credentials .session me saved hote hain
+                    raise Exception("No active login. Pehle Login karein.")
                 cls.client = Client(
                     name=SESSION_FILE,
-                    api_id=0, api_hash="",  # Session file se auto-load
                     workdir="."
                 )
 
             if not cls.client.is_connected:
-                try:
-                    await cls.client.connect()
-                except Exception:
-                    # Re-create client from session
-                    cls.client = Client(
-                        name=SESSION_FILE,
-                        api_id=0, api_hash="",
-                        workdir="."
-                    )
-                    await cls.client.connect()
+                await cls.client.connect()
 
-            # Verify session is valid
             try:
                 await cls.client.get_me()
             except (AuthKeyUnregistered, UserDeactivated):
@@ -127,6 +167,7 @@ class TGClient:
 
     @classmethod
     async def _cleanup(cls):
+        cls._clear_auth_state()
         try:
             if cls.client:
                 if cls.client.is_connected:
@@ -137,7 +178,11 @@ class TGClient:
                 cls.client = None
         except Exception:
             pass
+
         for ext in [".session", ".session-journal"]:
             f = f"{SESSION_FILE}{ext}"
             if os.path.exists(f):
-                os.remove(f)
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
